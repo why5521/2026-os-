@@ -1,4 +1,12 @@
-# 实验二：物理内存和页表
+# 操作系统实验二：物理内存和页表
+
+## 实验基本信息
+
+| 项目 | 内容 |
+|---|---|
+| 实验名称 | Lab2：物理内存和页表管理 |
+| 小组成员 | 李星泽、魏华阳、张煜坤 |
+| 完成日期 | 2026-10-23 |
 
 ## 一、实验目的
 
@@ -6,11 +14,20 @@
 2. 理解以页为单位管理物理内存的方法，掌握 `Page` 描述符数组的建立过程；
 3. 理解虚拟地址、物理地址和物理页号之间的转换关系，掌握 `PADDR`、`pa2page`、`page2pa` 等接口；
 4. 理解 `pmm_manager` 框架，掌握 First-Fit 与 Best-Fit 连续物理内存分配算法；
-5. 从零实现 Buddy System 分配器并设计测试，比较不同页面分配算法的特点。
+5. 实现 Buddy System 分配器并设计测试，比较不同页面分配算法的特点。
+6. 用gdb调试qemu内部程序，查看虚拟地址如何转化成物理地址
 
-## 二、整体逻辑线
+## 二、实验环境
 
-本实验围绕“发现物理内存 → 建立页描述符 → 管理空闲页 → 分配/释放页”这一条主线展开，调用链为：
+- 操作系统内核：ucore（RISC-V）
+- 模拟环境：QEMU，使用 OpenSBI 启动内核，qemu-system-riscv64
+- 地址转换与分页机制：Sv39
+- 内存信息来源：设备树（DTB）
+- 构建与测试：Makefile、`tools/grade.sh`
+
+## 三、实验整体逻辑
+
+本实验围绕“发现物理内存 → 建立页描述符 → 管理空闲页 → 分配/释放页”这一条主线展开。整体调用链如下：
 
 ```text
 kern_init()
@@ -21,121 +38,54 @@ kern_init()
        -> check_alloc_page()     调用 pmm_manager->check() 验证分配/释放正确性
 ```
 
-具体步骤：
+### 项目组成与执行流程
 
-1. `entry.S` 在进入 C 语言之前建立启动页表并开启 Sv39 分页，把内核的高地址虚拟空间映射到物理内存；
-2. `kern_init()` 先清零 BSS，再调用 `dtb_init()` 从设备树中解析出 `memory_base` 和 `memory_size`；
-3. `pmm_init()` 首先通过 `init_pmm_manager()` 选定 `best_fit_pmm_manager`；
-4. `page_init()` 计算 `npage`、`pages`、`va_pa_offset`，把所有描述符先标记为保留，再把描述符数组之后的完整空闲页交给当前管理器；
-5. `best_fit_init_memmap()` 把空闲页块按地址顺序插入空闲链表；
-6. 之后 `alloc_pages()` / `free_pages()` 通过 `pmm_manager` 的函数指针完成页面的分配、拆分、回收和合并。
+- `kern/driver/dtb.c`：解析设备树，获取物理内存的起始地址和长度；
+- `kern/mm/pmm.c`：负责物理内存初始化，并通过统一接口调用当前物理内存管理器；
+- `kern/mm/pmm.h`：定义 `struct pmm_manager`、`Page` 相关接口以及地址转换接口；
+- `kern/mm/default_pmm.c`：实现 First-Fit 分配器；
+- `kern/mm/best_fit_pmm.c`：实现 Best-Fit 分配器；
+- `kern/mm/buddy_pmm.c`、`kern/mm/buddy_pmm.h`：实现 Buddy System 分配器；
+- `kern/mm/memlayout.h`、`kern/mm/mmu.h`、`kern.ld`：提供内存布局、分页相关定义和链接地址信息。
 
-## 三、核心文件与函数理解
+### 初始化与分配流程
 
-### 1. `kern/driver/dtb.c`：物理内存探测
+1. `entry.S` 在进入 C 语言之前建立启动页表并开启 Sv39 分页，将内核高地址虚拟空间映射到物理内存；
+2. `kern_init()` 清零 BSS 后调用 `dtb_init()`，解析设备树并得到 `memory_base` 和 `memory_size`；
+3. `pmm_init()` 通过 `init_pmm_manager()` 选定物理内存管理器；当前配置使用 `best_fit_pmm_manager`；
+4. `page_init()` 计算 `npage`、`pages` 和 `va_pa_offset`，先把所有页描述符标记为保留，再把描述符数组之后的完整空闲页交给管理器；
+5. `best_fit_init_memmap()` 按物理地址顺序将空闲页块加入空闲链表；
+6. 后续的 `alloc_pages()` 和 `free_pages()` 通过 `pmm_manager` 的函数指针完成页面分配、拆分、释放和合并。
 
-`kern_entry` 把 OpenSBI 传入的 DTB 物理地址保存在 `boot_dtb` 中。`dtb_init()` 把该地址加上 `PHYSICAL_MEMORY_OFFSET` 得到虚拟地址，校验魔数 `0xd00dfeed`，然后遍历设备树结构，找到 `memory` 节点的 `reg` 属性，得到内存起始地址和长度，分别保存在 `memory_base`、`memory_size` 中，供 `page_init()` 使用。
-
-### 2. `kern/mm/pmm.c`：`page_init()`
-
-`page_init()` 是本实验的第一个核心任务，主要完成以下工作：
-
-- 校验 `get_memory_base()` 和 `get_memory_size()` 的结果，无效时调用 `panic()`；
-- 设置 `va_pa_offset = PHYSICAL_MEMORY_OFFSET`，使 `PADDR` 能把内核虚拟地址转换成物理地址；
-- 由内存末端计算 `npage = PPN(mem_end)`，由 DRAM 起始地址得到固定的 `nbase`；
-- 令 `pages` 指向内核 `end` 之后按页对齐的地址，并把 `[nbase, npage)` 对应的所有 `Page` 描述符初始化为保留状态；
-- 计算描述符数组末尾的物理地址，再向上按页对齐，得到空闲区起点；
-- 把内存末端向下按页对齐，去掉不完整的尾页；
-- 仅当空闲区非空时调用 `init_memmap(base, n)`，把这段完整页面交给当前管理器；
-- 按实验指导书要求的格式输出物理内存布局。
-
-关键点是必须区分：
+### 地址与页描述符的对应关系
 
 ```text
 内核虚拟地址 end          -> 用 PADDR 转成物理地址
 Page 描述符虚拟地址 pages -> 用 PADDR 转成物理地址
-物理地址                  -> PPN / PGSIZE 得到物理页号
-物理页号                  -> pages[ppn - nbase] 得到描述符
+物理地址                  -> 通过 PPN / PGSIZE 得到物理页号
+物理页号                  -> 通过 pages[ppn - nbase] 得到 Page 描述符
 ```
 
-### 3. `kern/mm/pmm.h`：`pmm_manager` 框架
+`struct pmm_manager` 将具体分配策略封装为一组函数指针，包括 `init`、`init_memmap`、`alloc_pages`、`free_pages`、`nr_free_pages` 和 `check`。`pmm.c` 中对应的公开接口主要负责转发到当前管理器，因此可以在不改变调用者的情况下切换分配算法。
 
-`struct pmm_manager` 用函数指针把一种页面分配算法封装成对象，包含：
+## 四、实验过程与结果
 
-- `init`：初始化算法内部数据结构；
-- `init_memmap`：把一段初始空闲物理页加入管理；
-- `alloc_pages`：分配至少 n 个连续物理页；
-- `free_pages`：释放从 `base` 开始的 n 个连续物理页；
-- `nr_free_pages`：返回空闲页数；
-- `check`：自检函数。
+### 1. 物理内存探测与页描述符初始化
 
-`pmm.c` 中的 `alloc_pages()`、`free_pages()`、`nr_free_pages()` 只是转发到当前 `pmm_manager`，因此切换算法只需要更换 `pmm_manager` 指向的结构体。
+`kern_entry` 将 OpenSBI 传入的 DTB 物理地址保存在 `boot_dtb` 中。`dtb_init()` 将该地址加上 `PHYSICAL_MEMORY_OFFSET` 得到虚拟地址，校验魔数 `0xd00dfeed`，再遍历设备树结构，找到 `memory` 节点的 `reg` 属性，获取内存起始地址和长度，并保存到 `memory_base`、`memory_size` 中供 `page_init()` 使用。
 
-### 4. `kern/mm/default_pmm.c`：First-Fit
+`page_init()` 是本实验的重要初始化环节，主要完成以下工作：
 
-First-Fit 使用一条按物理地址升序排列的空闲块链表：
+- 检查 `get_memory_base()` 和 `get_memory_size()` 的结果，无效时调用 `panic()`；
+- 设置 `va_pa_offset = PHYSICAL_MEMORY_OFFSET`，供 `PADDR` 将内核虚拟地址转换成物理地址；
+- 根据内存末端计算 `npage = PPN(mem_end)`，根据 DRAM 起始地址得到固定的 `nbase`；
+- 令 `pages` 指向内核 `end` 之后按页对齐的虚拟地址，并将 `[nbase, npage)` 对应的 `Page` 描述符先初始化为保留状态；
+- 计算描述符数组末尾的物理地址，并向上按页对齐，得到可用空闲区的起点；
+- 将内存末端向下按页对齐，排除不完整的尾页；
+- 只有空闲区非空时才调用 `init_memmap()`；
+- 按要求输出物理内存布局。
 
-- `default_init_memmap()`：把每个页描述符的 `ref`、`flags`、`property` 清零，块首页的 `property` 记录块大小，并置 `PG_property`；
-- `default_alloc_pages()`：从头遍历链表，找到第一个 `property >= n` 的块；若块比需求大，就把剩余部分拆成新块插回链表；
-- `default_free_pages()`：把释放的页重新标记为空闲块，插入链表，并分别与前后相邻的空闲块合并。
-
-### 5. `kern/mm/best_fit_pmm.c`：Best-Fit
-
-Best-Fit 与 First-Fit 的数据结构相同，区别在分配策略：
-
-- `best_fit_init_memmap()`：按物理地址升序插入空闲块，保证链表有序；
-- `best_fit_alloc_pages()`：遍历整条空闲链表，在所有 `property >= n` 的块中选择 `property` 最小的块；若容量相同，保留先遇到的地址较小的块；
-- `best_fit_free_pages()`：按地址顺序插入被释放的块，并同时检查前驱和后继，完成相邻空闲块合并；
-- 最后定义 `best_fit_pmm_manager`，并在 `init_pmm_manager()` 中把当前管理器切换为它。
-
-### 6. `kern/mm/buddy_pmm.c`：Buddy System
-
-Buddy System 把空闲内存按 2 的幂大小分块，`order = k` 的块包含 `2^k` 个连续页，且起始物理页号按 `2^k` 对齐：
-
-- 每种 order 维护一条空闲链表，块首页的 `property` 记录块大小；
-- `buddy_init_memmap()`：由于初始空闲区的起点和长度不一定是 2 的幂，需要把区间分解成若干个自然对齐的 2 的幂块；
-- `buddy_alloc_pages()`：找到最小的可用 order，若块比需求大就逐层对半拆分，后半块放回较低 order 的空闲链表；
-- `buddy_free_pages()`：释放后通过 `buddy_ppn = ppn ^ size` 找到伙伴块，若伙伴空闲且 order 相同就合并，并不断向上重复；
-- `buddy_check()`：自行编写的测试函数，检查链表属性、对齐、分配、释放及合并。
-
-## 四、练习解答
-
-### 功能模块一 任务一：物理内存探测与页描述符初始化
-
-#### spec
-
-实现 `kern/mm/pmm.c` 中的 `static void page_init(void)`：
-
-- 无参数、无返回值，由 `pmm_init()` 调用；
-- 读取 `get_memory_base()` / `get_memory_size()`，无效时终止初始化；
-- 正确设置 `va_pa_offset`、`npage`、`pages`；
-- 所有 `Page` 描述符先置为保留状态；
-- 内核镜像、描述符数组以及不完整尾页都不能进入空闲区；
-- 只有存在完整空闲页时才调用 `init_memmap()`；
-- 输出物理内存布局。
-
-#### prompt
-
-```text
-请阅读 lab2 的 kern/mm/pmm.c、pmm.h、memlayout.h、mmu.h、dtb.c 和 kern.ld，
-实现 static void page_init(void)。
-
-要求：
-1. 从 get_memory_base()/get_memory_size() 获取物理内存范围，非法时 panic；
-2. 设置 va_pa_offset = PHYSICAL_MEMORY_OFFSET；
-3. 按内存末端设置 npage = PPN(mem_base + mem_size)；
-4. pages 指向内核 end 之后按 PGSIZE 对齐的虚拟地址；
-5. 先把 [nbase, npage) 的所有 Page 描述符置为 reserved；
-6. 描述符数组末尾的物理地址向上按页对齐作为空闲区起点；
-7. 内存末端向下按页对齐作为空闲区终点；
-8. 只有空闲区非空时才调用 init_memmap(pa2page(free_start), n)；
-9. 输出 "physical memory map:" 和 "  memory: ..." 两行；
-10. 不得修改 pmm.h 中已有的地址转换接口和测试框架。
-```
-
-#### 实现说明
-
-实现中先用 `PADDR(end)` 得到内核物理末尾，再计算描述符数组占用的字节数：
+空闲区边界的计算关系如下：
 
 ```text
 pages_end_pa = PADDR(pages) + (npage - nbase) * sizeof(struct Page)
@@ -143,72 +93,28 @@ free_start_pa = ROUNDUP(pages_end_pa, PGSIZE)
 free_end_pa   = ROUNDDOWN(mem_end, PGSIZE)
 ```
 
-所有描述符一开始都 `SetPageReserved()`，因此内核尾页和描述符数组所在页天然不会被分配器使用；`init_memmap()` 内部会检查 `PageReserved()` 并在建立空闲块时清除这些页的保留状态。
+所有描述符一开始都通过 `SetPageReserved()` 标记为保留状态，因此内核镜像和描述符数组占用的页面不会被直接交给分配器。`init_memmap()` 在建立空闲块时会检查页面状态，并清除纳入空闲区的页面的保留状态。
 
-#### 思考题：OS 如何获取可用物理内存范围
+### 2. First-Fit 分配器
 
-如果 OS 无法提前知道硬件内存范围，可以采用以下方法：
+First-Fit 使用一条按物理地址升序排列的空闲块链表。
 
-1. **固件/引导协议传递**：由 bootloader（如 OpenSBI、UEFI、GRUB）探测内存并通过 DTB、UEFI Memory Map、multiboot 信息等结构告诉内核；
-2. **设备树/ACPI**：从 `memory` 节点或 SRAT 等表中读取；
-3. **主动探测**：在允许的地址空间内尝试读写并捕获总线异常，从而判断哪些地址对应真实 RAM（需要小心不能覆盖固件和外设）；
-4. **体系结构寄存器或 ROM 表**：部分平台提供内存大小寄存器或固件配置表。
+- `default_init_memmap()`：将页描述符的 `ref`、`flags`、`property` 清零；块首页的 `property` 记录空闲块大小，并设置 `PG_property`；
+- `default_alloc_pages()`：从链表头开始查找第一个满足 `property >= n` 的空闲块；如果块大于需求，则拆分剩余部分并将其插回链表；
+- `default_free_pages()`：将释放的页面重新标记为空闲块，按地址插入链表，并尝试与前后相邻空闲块合并。
 
-本实验采用的正是第 1、2 种方式：OpenSBI 扫描硬件后把 DTB 地址放在 `a1`，内核解析 DTB 得到内存范围。
+First-Fit 的主要优点是实现简单。其不足在于查找过程可能需要扫描较长的链表，且分配结果依赖空闲块的排列顺序。可以考虑采用 next-fit 指针、按大小分桶、记录最大空闲块或使用更合适的数据结构降低查找开销；多核环境下还需要对空闲链表进行同步保护。
 
-### 功能模块二 任务一：理解 First-Fit
+### 3. Best-Fit 分配器
 
-First-Fit 的流程可以概括为：
+Best-Fit 与 First-Fit 使用相似的数据结构，区别在于分配策略：它会遍历空闲链表，在所有满足 `property >= n` 的空闲块中选择容量最小的块；如果容量相同，则保留地址较小的块。
 
-1. **初始化空闲页**：`default_init_memmap()` 把一段连续物理页视为一个大空闲块，块首页记录大小并置 `PG_property`；
-2. **分配连续页**：`default_alloc_pages()` 从空闲链表头开始找第一个容量足够的块，若块太大则把剩余部分拆成新块插回链表；
-3. **回收页面**：`default_free_pages()` 清空被释放页的状态，把它们重新组成一个空闲块并按地址插入链表；
-4. **合并相邻块**：释放时检查前一个和后一个空闲块，如果物理地址连续就合并，减少外部碎片。
+- `best_fit_init_memmap()`：按物理地址升序插入初始空闲块；
+- `best_fit_alloc_pages()`：遍历整条空闲链表，选择满足需求且容量最小的块；块过大时，将剩余部分作为新的空闲块插回链表；
+- `best_fit_free_pages()`：按地址顺序插入被释放的块，并分别检查前驱和后继，合并相邻的空闲块；
+- `best_fit_pmm_manager`：注册 `init`、`init_memmap`、`alloc_pages`、`free_pages`、`nr_free_pages` 和 `check` 等接口，并在 `init_pmm_manager()` 中选择该管理器。
 
-First-Fit 的改进空间：
-
-- 空闲链表无序时分配需要 O(n)，可以按地址或大小组织，甚至使用分离空闲链表、平衡树；
-- 每次从头扫描容易产生低地址碎片，可加入 next-fit 指针或按大小分桶；
-- 可以记录最大空闲块，快速判断能否满足大块请求；
-- 多核环境下需要加锁保护空闲链表。
-
-### 功能模块二 任务二：实现 Best-Fit
-
-#### spec
-
-在 `kern/mm/best_fit_pmm.c` 中实现完整的 Best-Fit 管理器：
-
-- 维护按地址升序排列的空闲块链表和全局空闲页数；
-- 分配时遍历所有空闲块，选择容量不小于 n 且容量最小的块；
-- 容量相同时选择地址较小的块，保证行为确定；
-- 块过大时拆分剩余部分；
-- 释放时按地址插入并合并前后相邻空闲块；
-- 定义 `best_fit_pmm_manager` 并完成注册；
-- 在 `init_pmm_manager()` 中切换到 `best_fit_pmm_manager`；
-- 不修改 `basic_check()` 和 `best_fit_check()`。
-
-#### prompt
-
-```text
-请参考 kern/mm/default_pmm.c 的 First-Fit 实现，在 kern/mm/best_fit_pmm.c 中
-实现 Best-Fit 物理内存管理器。
-
-要求：
-1. 使用 free_area_t 维护按物理地址升序的空闲块链表；
-2. init_memmap：断言页为 reserved，清零 flags/property/ref，块首页记录大小；
-3. alloc_pages：遍历所有空闲块，选择 property >= n 且 property 最小的块；
-   若 property 相同，选择地址较小的块；块过大时把 page+n 开始的剩余部分
-   作为新空闲块插回链表；
-4. free_pages：按地址插入空闲链表，并分别与 prev 和 next 合并相邻块；
-5. 定义 best_fit_pmm_manager，注册 init/init_memmap/alloc_pages/free_pages/
-   nr_free_pages/check；
-6. 在 pmm.c 的 init_pmm_manager() 中改用 &best_fit_pmm_manager；
-7. 不修改 basic_check 和 best_fit_check。
-```
-
-#### 实现说明
-
-分配时的核心循环如下（伪代码）：
+核心选择逻辑可以概括为：
 
 ```text
 best = NULL
@@ -217,168 +123,117 @@ for each free block p:
         best = p
 ```
 
-由于链表本身按地址升序，容量相同时先遇到的块地址更小，直接保留即可。释放时先按地址插入，再与 `list_prev`、`list_next` 指向的块比较 `p + p->property == base` 或 `base + base->property == p`，满足条件就合并。
+由于链表按地址升序排列，容量相同的空闲块会优先保留先遍历到的块，因此能够稳定地选择地址较小的块。释放时，先按地址插入，再比较相邻块的地址与大小，满足连续条件时进行合并。
 
-#### 思考题：Best-Fit 的改进空间
+当前实现每次分配都需要遍历链表，时间复杂度为 O(n)。可进一步采用按块大小组织的分离链表、平衡树或分桶结构，降低查找开销；也可以结合块大小与地址设计混合策略，在分配速度和内存碎片之间折中。
 
-- 当前实现每次分配都要遍历整条链表，时间复杂度 O(n)；可以按块大小建立分离链表或平衡树，把查找降到 O(log n)；
-- 可以维护“最小可用块”或按 order 分桶，快速判断是否存在合适块；
-- 拆分和合并频率较高时，可加入延迟合并或空闲块缓存；
-- 多核场景下需要锁或 per-CPU 空闲链表；
-- 可结合地址和大小做混合策略，在碎片率和分配速度之间折中。
+### 4. Buddy System 分配器
 
-### 功能模块二 任务三：Buddy System
+Buddy System 将空闲内存按 2 的幂大小分块。`order = k` 的块包含 `2^k` 个连续页面，且起始物理页号必须按 `2^k` 对齐。每种 `order` 维护一条空闲链表，块首页的 `property` 记录块大小。
 
-#### prompt 一：从零生成并接入
+- `buddy_init_memmap()`：初始空闲区的起点和长度不一定是 2 的幂，因此需要将其拆分成多个自然对齐的 2 的幂大小块；
+- `buddy_alloc_pages()`：找到能够满足请求的最小可用 `order`，如果块过大则逐层对半拆分，并把后半块加入对应的较低 `order` 空闲链表；
+- `buddy_free_pages()`：释放页面后，通过 `buddy_ppn = ppn ^ size` 查找伙伴块；当伙伴仍为空闲块且 `order` 相同时，就合并两个块，并继续尝试向上合并；
+- `buddy_check()`：检查链表属性、块对齐、分配、释放和伙伴合并等行为。
 
-```text
-请参考 ucore 的 struct pmm_manager 和 struct Page，从零实现一个 Buddy System
-物理内存管理器（kern/mm/buddy_pmm.c 和 buddy_pmm.h）。
+初始化时，分配器从空闲区起点开始，每次选择“不超过剩余长度且起始页号满足大小对齐要求”的最大 2 的幂块，直到覆盖整个初始空闲区。这样可以避免把非 2 的幂大小的内存区错误地当成一个完整伙伴块。
 
-要求：
-1. order=k 的块大小为 2^k 页，起始物理页号必须按 2^k 对齐；
-2. 每种 order 一条空闲链表，块首页的 property 记录块大小；
-3. init_memmap：把不一定按 2 的幂对齐的初始空闲区分解成若干自然对齐块；
-4. alloc_pages(n)：找到最小的可用 order，逐层对半拆分，把后半块加入低 order 链表；
-5. free_pages(base,n)：用 ppn ^ size 找伙伴，伙伴空闲且 order 相同时合并，
-   并循环向上合并；
-6. 定义 buddy_pmm_manager 并注册全部接口；
-7. 不改变当前 Best-Fit 的默认启用状态，但代码要能通过切换管理器接入内核。
-```
+测试覆盖以下内容：
 
-#### prompt 二：设计测试
+- **结构不变量**：链表中的块设置了 `PG_property`，`property` 与对应 `order` 的块大小一致，起始页号满足对齐要求；
+- **分配行为**：分配 1、2、4、8 页块，检查返回值非空、块之间不重叠、地址满足对齐约束，并检查分配后的 `PG_property` 状态；
+- **释放与合并**：释放后，`nr_free_pages()` 恢复到初始值；
+- **再次分配**：释放多个块后再次申请 8 页块，检查伙伴块是否能够成功合并。
 
-```text
-请为上面的 Buddy System 实现编写 buddy_check()，覆盖：
-1. 各 order 链表中块的大小、property 和物理页号对齐；
-2. 分配 1/2/4/8 页块，检查非空、互不重叠、地址对齐、PG_property 已清除；
-3. 释放后空闲页数恢复到初始值；
-4. 释放后能够再次分配一个 8 页块，验证伙伴合并确实发生；
-5. 不依赖未公开的内部变量，只通过 pmm_manager 接口和 Page 字段检查。
-```
+这些检查能够发现拆分时未将后半块放回链表、伙伴页号计算错误、`nr_free` 计数不一致、块首页标志位未正确清除等问题。测试通过 `pmm_manager` 接口和 `Page` 字段进行检查，不依赖未公开的内部变量。
 
-#### 测试覆盖与有效性
-
-`buddy_check()` 覆盖了：
-
-- **结构不变量**：链表中的每个块都置了 `PG_property`，`property` 等于对应 order 的块大小，起始页号按块大小对齐；
-- **分配行为**：不同大小请求都能成功，返回块互不重叠，且地址满足对齐约束；
-- **释放与合并**：释放后 `nr_free_pages()` 回到初始值，说明没有丢页或重复计数；
-- **再次分配**：释放多个块后仍能分配 8 页块，说明伙伴块确实被合并，而不是仅仅挂在链表上。
-
-这些检查能有效发现常见的 Buddy 实现错误，例如拆分时忘记把后半块放回链表、合并时用错伙伴页号、`nr_free` 增减不一致、块首页标志位没有正确清除等。
-
-#### 接入方式
-
-当前提交中 `init_pmm_manager()` 仍然选择 `best_fit_pmm_manager`，以满足评分脚本对 `[Test 2] Best-Fit: PASS` 的要求。若需要单独运行 Buddy System，只需把：
-
-```c
-pmm_manager = &best_fit_pmm_manager;
-```
-
-改成：
+当前 `init_pmm_manager()` 仍然默认选择 `best_fit_pmm_manager`，以满足评分脚本对 Best-Fit 的测试要求。需要单独测试 Buddy System 时，可以将管理器指针切换为：
 
 ```c
 pmm_manager = &buddy_pmm_manager;
 ```
 
-`page_init()` 会自动调用 `buddy_init_memmap()`，随后 `check_alloc_page()` 会调用 `buddy_check()`。
+此时 `page_init()` 会调用 `buddy_init_memmap()`，后续 `check_alloc_page()` 会调用 `buddy_check()`。本次未完成 SLUB 扩展任务，因此不包含该部分的实现和测试。
 
-### 扩展任务 Challenge：SLUB
+### 5. 分支任务：gdb调试qemu
 
-本次未完成 SLUB 扩展任务，因此不在报告中提交相关 prompt 与测试。
+按照实验手册的指示，得到调试图片见`images`
 
-## 五、运行结果
+## 五、调试问题与解决
 
-编译并运行后，内核输出（节选）如下：
+### 1. 开启 Sv39 后发生取指缺页
 
-```text
-DTB Init
-HartID: 0
-DTB Address: 0x87e00000
-Physical Memory from DTB:
-  Base: 0x0000000080000000
-  Size: 0x0000000008000000 (128 MB)
-  End:  0x0000000087ffffff
-DTB init completed
-(THU.CST) os is loading ...
-Special kernel symbols:
-  entry  0xffffffffc02000d6 (virtual)
-  etext  0xffffffffc0201670 (virtual)
-  edata  0xffffffffc0206018 (virtual)
-  end    0xffffffffc0206078 (virtual)
-Kernel executable memory footprint: 24KB
-memory management: best_fit_pmm_manager
-physical memory map:
-  memory: 0x0000000080000000, [0x0000000080000000, 0x0000000087ffffff].
-check_alloc_page() succeeded!
-satp virtual address: 0xffffffffc0205000
-satp physical address: 0x0000000080205000
-```
-
-在临时目录中注入官方测试后运行 `tools/grade.sh`，结果为：
-
-```text
-  -check page init:                          OK
-  -check best fit:                           OK
-Total Score: 20/20
-```
-
-## 六、遇到的问题与解决
-
-### 1. 打开 Sv39 后取指缺页
-
-**现象**：内核在 QEMU 中完全没有输出，QEMU 异常日志显示：
+**现象：** 内核在 QEMU 中没有输出，异常日志显示：
 
 ```text
 cause: 0xc (exec_page_fault), epc: 0x0000000080200038
 ```
 
-`0x80200038` 正是 `csrw satp` 之后的 `sfence.vma`。
+`0x80200038` 是执行 `csrw satp` 后的 `sfence.vma` 所在位置。
 
-**原因**：启动页表只把高地址 `0xFFFFFFFFC0000000` 开始的 1 GiB 映射到物理内存，没有映射当前正在执行的物理地址 `0x80200000` 附近。新版 QEMU 在写 `satp` 后不会继续在同一个翻译块中执行后续指令，因此下一条指令立即按新页表取指并缺页。
+**原因：** 启动页表只将高地址 `0xFFFFFFFFC0000000` 开始的 1 GiB 映射到物理内存，没有映射当前正在执行的 `0x80200000` 附近的物理地址。写入 `satp` 后，后续指令按新页表取指，因缺少对应映射而发生异常。
 
-**解决**：在 `boot_page_table_sv39` 中增加一个恒等映射项，把 `VA=0x80000000` 映射到 `PA=0x80000000`，使写 `satp` 后的几条指令仍能正常取指；随后 `jr` 跳到高地址虚拟空间，仍由原来的最后一项映射负责。该修改不影响 `page_init()` 和评分测试。
+**解决：** 在 `boot_page_table_sv39` 中增加恒等映射项，将 `VA=0x80000000` 映射到 `PA=0x80000000`，使切换页表后的指令仍能正常取指；之后再通过 `jr` 跳到高地址虚拟空间，由原有映射继续执行。该修改不影响 `page_init()` 和评分测试。
 
-### 2. `-device loader` 不设置入口地址
+### 2. `-device loader` 未设置入口地址
 
-**现象**：使用 Makefile 原来的 `-device loader,file=bin/ucore.img,addr=0x80200000` 时，OpenSBI 打印 `Domain0 Next Address: 0x0`，内核不会开始执行。
+**现象：** 使用原 Makefile 中的 `-device loader,file=bin/ucore.img,addr=0x80200000` 时，OpenSBI 输出 `Domain0 Next Address: 0x0`，内核未开始执行。
 
-**原因**：新版 QEMU 的 `loader` 设备只负责把文件写入内存，不再像旧版本那样顺带设置下一跳地址。
+**原因：** 当前使用的 QEMU `loader` 设备只负责将文件写入内存，不会像预期那样同时设置下一跳地址。
 
-**解决**：把 `make qemu`、`make debug`、`make test` 和 `tools/grade.sh` 中的加载方式改为 `-kernel bin/ucore.img`，由 QEMU 在加载镜像的同时设置 `Next Address=0x80200000`。
+**解决：** 将 `make qemu`、`make debug`、`make test` 和 `tools/grade.sh` 中的加载方式改为 `-kernel bin/ucore.img`，由 QEMU 加载镜像并设置 `Next Address=0x80200000`。
 
-### 3. Best-Fit 的合并与拆分边界
+### 3. Best-Fit 拆分和合并边界
 
-**问题**：实现 Best-Fit 时容易漏掉两种情况：块比请求大时需要把剩余部分插入链表；释放时需要同时合并前驱和后继。
+**问题：** 分配时，如果空闲块大于请求大小，需要将剩余部分重新插入链表；释放时，则需要同时检查前驱和后继块是否相邻。
 
-**解决**：拆分时先保存 `list_prev(&page->page_link)`，删除原块后把剩余块插到该位置，保证链表仍按地址有序；释放时先按地址插入，再分别检查 `prev` 和 `next`，并在合并后更新 `base` 指针和 `property`。
+**解决：** 拆分时先保存 `list_prev(&page->page_link)`，删除原块后将剩余块插入相应位置，维持链表的地址顺序。释放时先按地址插入，再分别检查 `prev` 和 `next`，合并后更新 `base` 指针和 `property`。
 
-### 4. Buddy 初始空闲区不是 2 的幂
+### 4. Buddy System 的初始空闲区不是 2 的幂
 
-**问题**：`page_init()` 交给分配器的空闲区起点和长度都不一定是 2 的幂，直接把整段当成一个块会破坏伙伴系统的对齐要求。
+**问题：** `page_init()` 交给分配器的空闲区起点和长度不一定满足 2 的幂要求，直接将其视为一个伙伴块会破坏对齐约束。
 
-**解决**：`buddy_init_memmap()` 从区间起点开始，每次选择“不超过剩余长度且起始页号按大小对齐”的最大 2 的幂块，循环分解，直到剩余长度为 0。
+**解决：** `buddy_init_memmap()` 从区间起点开始，每次选取不超过剩余长度且起始页号满足对齐条件的最大 2 的幂块，循环分解直到剩余长度为 0。
+
+## 六、练习与思考
+
+### 1. 操作系统如何获取可用物理内存范围
+
+如果操作系统无法预先知道硬件内存范围，可以采用以下途径：
+
+1. **固件或引导协议传递：** 由 bootloader（如 OpenSBI、UEFI、GRUB）探测内存，再通过 DTB、UEFI Memory Map、Multiboot 信息等结构传递给内核；
+2. **设备树或 ACPI：** 从 `memory` 节点或 SRAT 等表中读取内存布局；
+3. **主动探测：** 在允许的地址范围内尝试读写并捕获总线异常，以判断哪些地址对应真实 RAM，但必须避免覆盖固件数据和外设区域；
+4. **体系结构寄存器或 ROM 表：** 部分平台会提供内存大小寄存器或固件配置表。
+
+本实验采用固件传递与设备树解析的方式：OpenSBI 将 DTB 地址放在寄存器 `a1` 中，内核解析 DTB 得到物理内存范围。
+
+### 2. First-Fit 与 Best-Fit 的特点
+
+First-Fit 从空闲链表头开始，选择第一个满足请求的空闲块，实现简单，但分配结果依赖链表顺序。Best-Fit 遍历空闲块，选择容量最接近请求大小的可用块，可能减少单次分配留下的剩余空间，但需要完整扫描链表。两者都需要在释放时合并相邻空闲块，并可能受到外部碎片影响。
+
+### 3. Buddy System 的特点
+
+Buddy System 将空闲内存划分为 2 的幂大小的块，分配时逐层拆分，释放时查找伙伴并合并。其合并过程较直接，但按 2 的幂分配可能产生内部碎片；初始内存区还必须先分解为满足大小和对齐约束的多个块。
 
 ## 七、重要知识点与 OS 原理的对应
 
 | 本实验知识点 | OS 原理知识点 | 含义、关系与差异 |
 | --- | --- | --- |
-| DTB 物理内存探测 | 硬件资源发现 / 引导协议 | 实验通过 OpenSBI 传递 DTB；原理中还包括 UEFI Memory Map、ACPI 等，目标都是让内核知道哪些物理地址可用 |
-| `struct Page` 描述符数组 | 页框管理 / 物理页框号 | 实验用连续数组描述每个物理页；原理中还可以用位图、页框数据库等结构，核心都是记录页框状态和引用计数 |
-| 空闲链表 + First-Fit | 连续内存分配 / 外部碎片 | 实验按块管理空闲页，首次适配容易实现但可能留下碎片；原理中还有最佳适配、最坏适配、伙伴系统等 |
-| Best-Fit | 动态分区分配 | 实验在页级实现“选择最小足够块”的策略；原理中 Best-Fit 常用于可变分区，二者都面临查找开销和碎片问题 |
-| Buddy System | 伙伴系统 / 内部碎片 | 实验按 2 的幂拆分合并；原理中伙伴系统常用于内核页分配和 DMA，优点是合并快，缺点是有内部碎片 |
-| `va_pa_offset`、`PADDR` | 地址转换 / 直接映射 | 实验的内核空间采用固定偏移的直接映射；原理中虚拟内存还需要多级页表和 TLB，二者处于不同层次 |
-| Sv39 启动页表 | 分页机制 / 多级页表 | 实验只建立了一个简单的 1 GiB 大页映射；原理中需要完整的虚拟地址空间管理、按需分页和页表切换 |
+| DTB 物理内存探测 | 硬件资源发现 / 引导协议 | 实验通过 OpenSBI 传递 DTB；原理中还包括 UEFI Memory Map、ACPI 等，目标都是让内核知道哪些物理地址可用。 |
+| `struct Page` 描述符数组 | 页框管理 / 物理页框号 | 实验用连续数组描述每个物理页；也可以使用位图、页框数据库等结构记录页框状态和引用计数。 |
+| 空闲链表与 First-Fit | 连续内存分配 / 外部碎片 | 实验按块管理空闲页，首次适配容易实现，但可能留下碎片；其他策略还包括 Best-Fit、Worst-Fit 和伙伴系统。 |
+| Best-Fit | 动态分区分配 | 实验在页级实现“选择最小足够块”的策略，面临查找开销和碎片问题。 |
+| Buddy System | 伙伴系统 / 内部碎片 | 实验按 2 的幂拆分和合并；伙伴系统合并较快，但可能产生内部碎片。 |
+| `va_pa_offset`、`PADDR` | 地址转换 / 直接映射 | 实验的内核空间采用固定偏移的直接映射；完整虚拟内存管理还涉及多级页表与 TLB。 |
+| Sv39 启动页表 | 分页机制 / 多级页表 | 实验建立了简单的 1 GiB 大页映射；完整系统还需要动态管理页表、按需分页和页表切换。 |
 
-## 八、OS 原理中重要但本实验未覆盖的知识点
+## 八、实验总结
 
-1. **按需分页与缺页异常处理**：本实验只做物理页分配，没有实现虚拟页到物理页的动态建立；
-2. **页面置换算法**：如 FIFO、LRU、Clock 等，本实验未涉及内存不足时的回收；
-3. **虚拟内存区域管理**：如 `mm_struct`、VMA、用户地址空间布局；
-4. **多级页表的完整管理**：本实验只建立启动时的大页映射，没有实现页表的动态分配、复制和释放；
-5. **TLB 刷新与地址空间切换**：只使用了 `sfence.vma`，未讨论 ASID、TLB shootdown；
-6. **并发与锁**：物理页分配器在单核启动阶段运行，未考虑多核竞争；
-7. **SLUB/SLAB 小对象分配**：属于扩展任务，本实验未实现；
-8. **内存碎片度量与回收策略**：未定量分析外部碎片和内部碎片。
+本实验完成了物理内存探测、页描述符数组初始化以及页面分配器的理解和测试。通过 DTB 获取物理内存范围后，`page_init()` 排除内核镜像、描述符数组和不完整尾页，将可用完整页面交给当前的物理内存管理器。First-Fit、Best-Fit 和 Buddy System 分别体现了不同的空闲块选择、拆分和合并策略；自动测试结果显示，页初始化与 Best-Fit 测试均通过，总分为 20/20。
+
+实验也说明，本实验的重点是物理页框管理，还没有实现按需分页与缺页异常处理、页面置换、用户虚拟地址空间管理、完整的多级页表动态管理、TLB 地址空间切换、多核同步、SLUB/SLAB 小对象分配，以及碎片率的定量分析。
+
+## 九、AI 协作开发经验
+
+本实验中使用 AI 辅助理解物理内存初始化、页面分配算法和调试问题，并将建议与实际代码、内核输出及自动测试结果进行核对。提示词和相关交互记录单独保存在 `prompt.md` 中。
