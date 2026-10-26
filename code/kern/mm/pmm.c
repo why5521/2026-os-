@@ -61,7 +61,11 @@ size_t nr_free_pages(void) {
     return pmm_manager->nr_free_pages();
 }
 
+<<<<<<< HEAD
 //lab2 function1 YOUR CODE
+=======
+//lab2 function1 2412114
+>>>>>>> 6aad1394a17efdfc34e9f5188348876a1bd58a5b
 /*
  * page_init - 根据设备树给出的物理内存信息建立页描述符数组，
  * 并把内核镜像与描述符数组之外的空闲物理页交给当前 pmm_manager 管理。

@@ -3,7 +3,11 @@
 #include <best_fit_pmm.h>
 #include <stdio.h>
 
+<<<<<<< HEAD
 //lab2 function2-2 YOUR CODE
+=======
+//lab2 function2-2 2412114
+>>>>>>> 6aad1394a17efdfc34e9f5188348876a1bd58a5b
 /*
  * Best-Fit 物理内存管理器：
  * 空闲页块按物理地址升序挂在 free_list 上；分配时遍历所有空闲块，
