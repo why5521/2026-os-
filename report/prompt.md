@@ -9,7 +9,7 @@
 确保在中断或异常后能保存/恢复上下文，在跳转到trap前将trap_frame栈顶sp作为参数
 ```
 
-##功能模块2：
+## 功能模块2：
 ```text
 [PROMPT]
 完成功能模块2：trap.c中的interrupt_handler（）和exception_handler（），分别处理中断和异常
