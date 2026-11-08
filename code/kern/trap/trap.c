@@ -94,7 +94,7 @@ static inline int inst_len(uintptr_t epc) {
 /* interrupt_handler - 处理中断 */
 void interrupt_handler(struct trapframe *tf) {
     // 中断的 cause 最高位(bit63)为 1，先去掉该标志位得到真实中断号
-    intptr_t cause = (tf->cause << 1) >> 1;
+    uintptr_t cause = tf->cause & ~(1UL << 63);
     switch (cause) {
         case IRQ_S_TIMER:
             // 设置下一次时钟中断，保证时钟中断能够持续产生
@@ -143,6 +143,7 @@ void interrupt_handler(struct trapframe *tf) {
             break;
         default:
             // 无法识别的中断，输出完整 trapframe 辅助调试
+            cprintf("Unknown interrupt: cause %d\n", (int)cause);
             print_trapframe(tf);
             break;
     }
@@ -153,13 +154,13 @@ void exception_handler(struct trapframe *tf) {
     switch (tf->cause) {
         case CAUSE_ILLEGAL_INSTRUCTION:
             cprintf("Exception type: Illegal instruction\n");
-            cprintf("Illegal instruction caught at 0x%08x\n", tf->epc);
+            cprintf("Illegal instruction at 0x%08x\n", tf->epc);
             // 跳过当前异常指令，避免返回后重复执行形成死循环
             tf->epc += inst_len(tf->epc);
             break;
         case CAUSE_BREAKPOINT:
             cprintf("Exception type: breakpoint\n");
-            cprintf("ebreak caught at 0x%08x\n", tf->epc);
+            cprintf("Breakpoint at 0x%08x\n", tf->epc);
             tf->epc += inst_len(tf->epc);
             break;
         default:
