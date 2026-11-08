@@ -1,0 +1,94 @@
+\documentclass[UTF8,a4paper,12pt]{ctexart}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{xcolor}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  columns=fullflexible
+}
+
+\title{操作系统实验报告\\Lab3：Trap处理与时钟中断}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{实验目的}
+本实验围绕 RISC-V 内核的异常与中断处理展开，目标是理解 Trap 发生时的上下文切换过程，完成断点和非法指令异常处理，并配置 Supervisor 定时器中断，使内核能持续响应时钟事件。
+
+\section{实验环境}
+\begin{itemize}[leftmargin=2em]
+  \item 操作系统：Windows 11 + WSL2 Ubuntu
+  \item 模拟器：QEMU \texttt{qemu-system-riscv64}
+  \item 编译工具链：\texttt{riscv64-unknown-elf-gcc} 交叉编译工具链
+  \item 目标平台：QEMU \texttt{virt} RISC-V 机器
+\end{itemize}
+
+\section{实验原理}
+\subsection{Trap入口与返回}
+处理器发生异常或中断时，硬件记录原因和返回地址等状态，并跳转到 \texttt{stvec} 指定的入口。入口汇编保存通用寄存器以及 \texttt{sstatus}、\texttt{sepc}、\texttt{stval}、\texttt{scause}，构造 trapframe 后调用 C 语言的 \texttt{trap()}。处理完成后恢复现场并执行 \texttt{sret}，从 Trap 返回。
+
+\subsection{异常返回地址}
+断点和非法指令处理完成后，若仍使用原 \texttt{sepc} 返回，会再次执行同一条指令并重复触发异常。因此需要按指令编码确定长度：最低两位为 \texttt{11} 时是 4 字节指令，否则是 2 字节压缩指令，并据此推进 \texttt{sepc}。
+
+\subsection{时钟中断}
+每次 Supervisor timer 中断都要调用 \texttt{clock\_set\_next\_event()} 安排下一次事件并递增 \texttt{ticks}。每累计 100 个时钟事件打印一次 \texttt{100 ticks}；累计打印 10 次后调用 SBI 关机接口。
+
+\section{实现内容与问题修复}
+\begin{enumerate}[leftmargin=2em]
+  \item 在 \texttt{trapentry.S} 中完成寄存器及 CSR 上下文保存和恢复，向 \texttt{trap()} 传入 trapframe 地址，并以 \texttt{sret} 返回。将不再被当前汇编器识别的旧 CSR 名称 \texttt{sbadaddr} 改为标准名称 \texttt{stval}。
+  \item 在 \texttt{trap.c} 中区分中断和异常。Supervisor timer 中断会重新设置下一次时钟事件、递增计数并在达到阈值后关机；断点和非法指令异常会按指令长度更新 EPC；未识别中断和其他异常会输出诊断信息及 trapframe。
+  \item 修复启动页表。原页表建立了内核高地址映射，但没有覆盖分页启用后跳转到高地址内核前仍在执行的物理地址，导致指令页错误。增加物理内存窗口的恒等映射后，启动代码可以继续运行并跳转到高地址映射。
+  \item 调整 QEMU 启动参数为 \texttt{-kernel bin/ucore.img}，以便 OpenSBI 获得正确的内核 Next Address；仅用 loader 设备加载镜像时，当前 QEMU/OpenSBI 组合报告的 Next Address 为 0，无法正常进入内核。
+\end{enumerate}
+
+\section{运行与测试}
+\subsection{自动评分}
+在代码目录执行：
+\begin{lstlisting}
+make clean
+make grade
+\end{lstlisting}
+当前副本的评分结果如下：
+\begin{center}
+\begin{tabular}{lr}
+\toprule
+测试项 & 得分\\
+\midrule
+Trap入口、寄存器恢复与断点返回 & 35/35\\
+非法指令EPC更新与异常返回 & 25/25\\
+Supervisor定时器持续触发与返回 & 40/40\\
+\midrule
+总分 & 100/100\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{QEMU运行观察}
+执行 \texttt{make} 编译后，以 QEMU 启动内核。串口输出包含内核启动信息，随后恰好出现 10 行 \texttt{100 ticks}。对应原始输出保存在仓库 \texttt{report/qemu\_run.txt}；自动评分完整输出保存在 \texttt{report/grade\_result.txt}。
+
+\section{实验结论}
+本实验验证了 Trap 入口保存现场、C 处理程序分发异常与中断、返回路径恢复现场的整体机制。时钟中断能够通过重新安排下一事件持续发生。调试中还确认，分页切换阶段的页表必须同时满足当前执行地址和目标高地址内核的映射需求；否则内核可能在启动早期产生指令页错误。
+
+\section{复现命令}
+\begin{lstlisting}
+make clean
+make grade
+\end{lstlisting}
+若只观察内核启动与定时器输出：
+\begin{lstlisting}
+make
+qemu-system-riscv64 -machine virt -nographic -bios default \
+  -kernel bin/ucore.img -no-reboot
+\end{lstlisting}
+
+\end{document}
